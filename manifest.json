@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Currency to NIS",
+  "version": "1.0",
+  "description": "Convert any currency to Israeli New Shekel (NIS) via right-click context menu",
+  "permissions": [
+    "contextMenus",
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://api.exchangerate-api.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["content.js"],
+    "run_at": "document_idle"
+  }],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}

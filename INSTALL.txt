@@ -1,0 +1,69 @@
+╔═══════════════════════════════════════════════════════════════╗
+║         CURRENCY TO NIS - QUICK INSTALLATION GUIDE            ║
+╚═══════════════════════════════════════════════════════════════╝
+
+📦 STEP 1: Open Chrome Extensions
+   → Go to chrome://extensions/
+   → Or: Menu (⋮) → More tools → Extensions
+
+🔧 STEP 2: Enable Developer Mode
+   → Toggle switch in TOP-RIGHT corner
+
+📂 STEP 3: Load Extension
+   → Click "Load unpacked" button
+   → Select this folder: chrome-to-nis
+   → Click "Select Folder"
+
+✅ STEP 4: Verify
+   → Extension "Currency to NIS" should appear
+   → Green icon with ₪ symbol visible
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+🎯 HOW TO USE:
+
+1. Select currency text on ANY webpage
+   Examples: "$28" or "50 EUR" or "£100"
+
+2. RIGHT-CLICK on selected text
+
+3. Click "To NIS" in context menu
+
+4. See conversion in notification!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+💡 EXAMPLES OF SUPPORTED FORMATS:
+
+   $28         →  Works!
+   28$         →  Works!
+   28 USD      →  Works!
+   USD 28      →  Works!
+   €50         →  Works!
+   50 EUR      →  Works!
+   £100        →  Works!
+   CA$40       →  Works!
+   ¥1000       →  Works!
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+❓ TROUBLESHOOTING:
+
+Problem: Extension not showing
+→ Enable Developer Mode
+→ Click refresh icon on extension
+→ Restart Chrome
+
+Problem: "Could not detect currency"
+→ Make sure text has BOTH number AND currency
+→ Try: "$28" instead of just "28"
+
+Problem: Network error
+→ Check internet connection
+→ Extension needs api.exchangerate-api.com access
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📖 For more details, see README.md
+
+Enjoy! 💱₪
