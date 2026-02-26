@@ -1,6 +1,6 @@
 // Listen for messages from background script
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'SHOW_CONVERSION') {
+  if (message.type === "SHOW_CONVERSION") {
     showTooltip(message.data);
   }
 });
@@ -26,41 +26,81 @@ function showTooltip(data) {
   const rect = range.getBoundingClientRect();
 
   // Create tooltip container
-  const container = document.createElement('div');
-  container.id = 'nis-converter-tooltip-container';
+  const container = document.createElement("div");
+  container.id = "nis-converter-tooltip-container";
 
   // Use Shadow DOM for style isolation
-  const shadow = container.attachShadow({ mode: 'open' });
+  const shadow = container.attachShadow({ mode: "open" });
 
   // Create tooltip element
-  const tooltip = document.createElement('div');
-  tooltip.className = 'nis-tooltip';
+  const tooltip = document.createElement("div");
+  tooltip.className = "nis-tooltip";
 
-  // Add content
-  const titleEl = document.createElement('div');
-  titleEl.className = 'nis-tooltip-title';
+  // Create header container for title and close button
+  const header = document.createElement("div");
+  header.className = "nis-tooltip-header";
+
+  // Add title
+  const titleEl = document.createElement("div");
+  titleEl.className = "nis-tooltip-title";
   titleEl.textContent = data.title;
 
-  const subtitleEl = document.createElement('div');
-  subtitleEl.className = 'nis-tooltip-subtitle';
+  // Create close button with SVG icon
+  const closeBtn = document.createElement("button");
+  closeBtn.className = "nis-tooltip-close";
+
+  // Create SVG icon using DOM methods
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("width", "20");
+  svg.setAttribute("height", "20");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-width", "2");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+
+  const line1 = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  line1.setAttribute("x1", "18");
+  line1.setAttribute("y1", "6");
+  line1.setAttribute("x2", "6");
+  line1.setAttribute("y2", "18");
+
+  const line2 = document.createElementNS("http://www.w3.org/2000/svg", "line");
+  line2.setAttribute("x1", "6");
+  line2.setAttribute("y1", "6");
+  line2.setAttribute("x2", "18");
+  line2.setAttribute("y2", "18");
+
+  svg.appendChild(line1);
+  svg.appendChild(line2);
+  closeBtn.appendChild(svg);
+  closeBtn.addEventListener("click", () => dismissTooltip());
+
+  header.appendChild(titleEl);
+  header.appendChild(closeBtn);
+
+  // Add content
+  const subtitleEl = document.createElement("div");
+  subtitleEl.className = "nis-tooltip-subtitle";
   subtitleEl.textContent = data.subtitle;
 
-  const timestampEl = document.createElement('div');
-  timestampEl.className = 'nis-tooltip-timestamp';
-  timestampEl.textContent = data.timestamp || 'Rate updated just now';
+  const timestampEl = document.createElement("div");
+  timestampEl.className = "nis-tooltip-timestamp";
+  timestampEl.textContent = data.timestamp || "Rate updated just now";
 
-  tooltip.appendChild(titleEl);
+  tooltip.appendChild(header);
   tooltip.appendChild(subtitleEl);
   tooltip.appendChild(timestampEl);
 
   // Add styles
-  const style = document.createElement('style');
+  const style = document.createElement("style");
   style.textContent = `
     .nis-tooltip {
       position: fixed;
       background: white;
       border: 1px solid #e0e0e0;
-      border-left: 4px solid ${data.success ? '#4CAF50' : '#f44336'};
+      border-left: 4px solid ${data.success ? "#4CAF50" : "#f44336"};
       border-radius: 8px;
       padding: 12px 16px;
       max-width: 300px;
@@ -69,7 +109,7 @@ function showTooltip(data) {
       z-index: 2147483647;
       opacity: 0;
       transition: opacity 0.2s ease-in;
-      pointer-events: none;
+      pointer-events: auto;
     }
 
     .nis-tooltip.show {
@@ -81,18 +121,47 @@ function showTooltip(data) {
       transition: opacity 0.3s ease-out;
     }
 
+    .nis-tooltip-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+
     .nis-tooltip-title {
       font-size: 16px;
       font-weight: 600;
-      color: ${data.success ? '#333' : '#d32f2f'};
-      margin-bottom: 4px;
+      color: ${data.success ? "#333" : "#d32f2f"};
       line-height: 1.4;
+      flex: 1;
+    }
+
+    .nis-tooltip-close {
+      background: none;
+      border: none;
+      color: #f44336;
+      cursor: pointer;
+      padding: 4px;
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 4px;
+      flex-shrink: 0;
+      transition: all 0.2s ease;
+    }
+
+    .nis-tooltip-close:hover {
+      color: #d32f2f;
+      box-shadow: inset 0 0 0 2px #f44336;
     }
 
     .nis-tooltip-subtitle {
       font-size: 13px;
       color: #666;
       line-height: 1.4;
+      margin-top: 8px;
     }
 
     .nis-tooltip-timestamp {
@@ -115,7 +184,7 @@ function showTooltip(data) {
 
   // Trigger fade-in animation
   requestAnimationFrame(() => {
-    tooltip.classList.add('show');
+    tooltip.classList.add("show");
   });
 
   // Store reference
@@ -135,7 +204,7 @@ function positionTooltip(tooltip, selectionRect) {
 
   // Calculate initial position (above and centered)
   let top = selectionRect.top - tooltipHeight - offset;
-  let left = selectionRect.left + (selectionRect.width / 2) - (tooltipWidth / 2);
+  let left = selectionRect.left + selectionRect.width / 2 - tooltipWidth / 2;
 
   // Adjust if would overflow top of viewport
   if (top < 10) {
@@ -173,9 +242,9 @@ function dismissTooltip(immediate = false) {
     currentTooltip = null;
   } else {
     // Fade out then remove
-    const tooltip = currentTooltip.shadowRoot.querySelector('.nis-tooltip');
-    tooltip.classList.remove('show');
-    tooltip.classList.add('fade-out');
+    const tooltip = currentTooltip.shadowRoot.querySelector(".nis-tooltip");
+    tooltip.classList.remove("show");
+    tooltip.classList.add("fade-out");
 
     setTimeout(() => {
       if (currentTooltip) {
