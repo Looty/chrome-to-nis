@@ -1,8 +1,21 @@
+// Track right-click target for context menu conversions
+let lastContextMenuText = null;
+let lastContextMenuPos = null;
+
+document.addEventListener('contextmenu', (e) => {
+  if (e.target.id === 'nis-converter-tooltip-container') return;
+  lastContextMenuText = e.target.innerText || '';
+  lastContextMenuPos = { x: e.clientX, y: e.clientY };
+});
+
 // Listen for messages from background script
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "SHOW_CONVERSION") {
     showTooltip(message.data);
+  } else if (message.type === "GET_ELEMENT_TEXT") {
+    sendResponse({ text: lastContextMenuText, pos: lastContextMenuPos });
   }
+  return true;
 });
 
 // Global reference to current tooltip for cleanup
@@ -16,14 +29,15 @@ function showTooltip(data) {
     dismissTooltip(true); // immediate dismissal
   }
 
-  // Get selection position
-  const selection = window.getSelection();
-  if (!selection.rangeCount) {
-    return;
+  // Get position: from right-click coord or selection
+  let rect;
+  if (data.pos) {
+    rect = { top: data.pos.y, bottom: data.pos.y, left: data.pos.x, right: data.pos.x, width: 0 };
+  } else {
+    const selection = window.getSelection();
+    if (!selection.rangeCount) return;
+    rect = selection.getRangeAt(0).getBoundingClientRect();
   }
-
-  const range = selection.getRangeAt(0);
-  const rect = range.getBoundingClientRect();
 
   // Create tooltip container
   const container = document.createElement("div");
@@ -162,6 +176,7 @@ function showTooltip(data) {
       color: #666;
       line-height: 1.4;
       margin-top: 8px;
+      white-space: pre-line;
     }
 
     .nis-tooltip-timestamp {
