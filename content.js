@@ -100,7 +100,7 @@ function showTooltip(data) {
       position: fixed;
       background: white;
       border: 1px solid #e0e0e0;
-      border-left: 4px solid ${data.success ? "#4CAF50" : "#f44336"};
+      border-left: 4px solid transparent;
       border-radius: 8px;
       padding: 12px 16px;
       max-width: 300px;
@@ -170,6 +170,23 @@ function showTooltip(data) {
       margin-top: 6px;
       font-style: italic;
       line-height: 1.4;
+    }
+
+    .nis-tooltip::before {
+      content: '';
+      position: absolute;
+      left: -4px;
+      top: 0;
+      width: 4px;
+      height: 100%;
+      background: ${data.success ? "#4CAF50" : "#f44336"};
+      border-radius: 8px 0 0 8px;
+      animation: nis-sidebar-drain 5s linear forwards;
+    }
+
+    @keyframes nis-sidebar-drain {
+      from { clip-path: inset(0 0 0 0 round 8px 0 0 8px); }
+      to   { clip-path: inset(100% 0 0 0 round 8px 0 0 8px); }
     }
   `;
 
