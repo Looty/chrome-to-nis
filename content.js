@@ -21,6 +21,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // Global reference to current tooltip for cleanup
 let currentTooltip = null;
 let dismissTimeout = null;
+let timerStartTime = null;   // Date.now() when dismiss timer started
+let remainingTime = null;    // ms remaining when drag begins
+let dragStartTime = null;    // Date.now() when mousedown fires
 
 // Show tooltip with conversion result
 function showTooltip(data) {
@@ -42,6 +45,8 @@ function showTooltip(data) {
   // Create tooltip container
   const container = document.createElement("div");
   container.id = "nis-converter-tooltip-container";
+  // Reset page-level zoom and font-size inheritance that can bleed into the shadow DOM
+  container.style.cssText = "all: initial; zoom: 1; display: block;";
 
   // Use Shadow DOM for style isolation
   const shadow = container.attachShadow({ mode: "open" });
@@ -203,6 +208,18 @@ function showTooltip(data) {
       from { clip-path: inset(0 0 0 0 round 8px 0 0 8px); }
       to   { clip-path: inset(100% 0 0 0 round 8px 0 0 8px); }
     }
+
+    .nis-tooltip.is-dragging::before {
+      animation-play-state: paused;
+    }
+
+    .nis-tooltip {
+      cursor: grab;
+    }
+
+    .nis-tooltip.is-dragging {
+      cursor: grabbing;
+    }
   `;
 
   shadow.appendChild(style);
@@ -214,15 +231,17 @@ function showTooltip(data) {
   // Add to page
   document.body.appendChild(container);
 
-  // Trigger fade-in animation
+  // Trigger fade-in animation and wire up drag
   requestAnimationFrame(() => {
     tooltip.classList.add("show");
+    addDragBehavior(tooltip);
   });
 
   // Store reference
   currentTooltip = container;
 
   // Auto-dismiss after 5 seconds
+  timerStartTime = Date.now();
   dismissTimeout = setTimeout(() => {
     dismissTooltip();
   }, 5000);
@@ -259,6 +278,66 @@ function positionTooltip(tooltip, selectionRect) {
   tooltip.style.left = `${left}px`;
 }
 
+// Add drag-to-move and freeze-timer-on-hold behavior to a tooltip element
+function addDragBehavior(tooltip) {
+  const closeBtn = tooltip.querySelector(".nis-tooltip-close");
+
+  let isDragging = false;
+  let mouseOffsetX = 0;
+  let mouseOffsetY = 0;
+
+  function onMouseDown(e) {
+    if (e.target === closeBtn || closeBtn.contains(e.target)) return;
+    if (e.button !== 0) return;
+    isDragging = true;
+
+    const rect = tooltip.getBoundingClientRect();
+    mouseOffsetX = e.clientX - rect.left;
+    mouseOffsetY = e.clientY - rect.top;
+
+    // Freeze timer
+    dragStartTime = Date.now();
+    const elapsed = dragStartTime - timerStartTime;
+    remainingTime = Math.max(0, 5000 - elapsed);
+    if (dismissTimeout) { clearTimeout(dismissTimeout); dismissTimeout = null; }
+    tooltip.classList.add("is-dragging");
+    e.preventDefault();
+  }
+
+  function onMouseMove(e) {
+    if (!isDragging) return;
+    const rect = tooltip.getBoundingClientRect();
+    const newLeft = Math.max(0, Math.min(e.clientX - mouseOffsetX, window.innerWidth - rect.width));
+    const newTop  = Math.max(0, Math.min(e.clientY - mouseOffsetY, window.innerHeight - rect.height));
+    tooltip.style.left = `${newLeft}px`;
+    tooltip.style.top  = `${newTop}px`;
+  }
+
+  function onMouseUp() {
+    if (!isDragging) return;
+    isDragging = false;
+    tooltip.classList.remove("is-dragging");
+
+    // Resume timer
+    if (remainingTime !== null && remainingTime > 0) {
+      timerStartTime = Date.now() - (5000 - remainingTime);
+      dismissTimeout = setTimeout(() => dismissTooltip(), remainingTime);
+    } else if (remainingTime !== null) {
+      dismissTooltip();
+    }
+    dragStartTime = null;
+  }
+
+  tooltip.addEventListener("mousedown", onMouseDown);
+  document.addEventListener("mousemove", onMouseMove);
+  document.addEventListener("mouseup", onMouseUp);
+
+  tooltip._removeDragListeners = () => {
+    document.removeEventListener("mousemove", onMouseMove);
+    document.removeEventListener("mouseup", onMouseUp);
+  };
+}
+
 // Dismiss tooltip with fade-out animation
 function dismissTooltip(immediate = false) {
   if (!currentTooltip) return;
@@ -270,11 +349,17 @@ function dismissTooltip(immediate = false) {
 
   if (immediate) {
     // Remove immediately without animation
+    const tooltipEl = currentTooltip.shadowRoot.querySelector(".nis-tooltip");
+    if (tooltipEl && tooltipEl._removeDragListeners) tooltipEl._removeDragListeners();
     currentTooltip.remove();
     currentTooltip = null;
+    timerStartTime = null;
+    remainingTime = null;
+    dragStartTime = null;
   } else {
     // Fade out then remove
     const tooltip = currentTooltip.shadowRoot.querySelector(".nis-tooltip");
+    if (tooltip && tooltip._removeDragListeners) tooltip._removeDragListeners();
     tooltip.classList.remove("show");
     tooltip.classList.add("fade-out");
 
@@ -282,6 +367,9 @@ function dismissTooltip(immediate = false) {
       if (currentTooltip) {
         currentTooltip.remove();
         currentTooltip = null;
+        timerStartTime = null;
+        remainingTime = null;
+        dragStartTime = null;
       }
     }, 300); // match CSS transition duration
   }
