@@ -1,4 +1,5 @@
 const MENU_ID = "to-nis";
+const COMMAND_ID = "convert-selection";
 const CACHE_TTL_MS = 60 * 60 * 1000;
 const API_URL = "https://open.er-api.com/v6/latest/ILS";
 const STORAGE_KEY = "rateCacheV2";
@@ -22,7 +23,7 @@ async function injectIntoExistingTabs() {
   await Promise.allSettled(
     tabs.map((tab) =>
       chrome.scripting.executeScript({
-        target: { tabId: tab.id, allFrames: false },
+        target: { tabId: tab.id, allFrames: true },
         files: ["content.js"]
       })
     )
@@ -42,15 +43,48 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   };
 
   try {
-    await sendToContentScript(tab.id, payload);
+    await sendToContentScript(tab.id, info.frameId ?? 0, payload);
   } catch (error) {
     console.error("Failed to send TO_NIS_RUN message", error);
   }
 });
 
-async function sendToContentScript(tabId, payload) {
+// The right-click happened in one specific frame (it may be an iframe), and
+// only that frame's content script holds the captured context.
+chrome.commands.onCommand.addListener(async (command, tab) => {
+  if (command !== COMMAND_ID || !tab?.id) {
+    return;
+  }
+
   try {
-    await chrome.tabs.sendMessage(tabId, payload);
+    const frameId = await findSelectionFrame(tab.id);
+    await sendToContentScript(tab.id, frameId, {
+      type: "TO_NIS_RUN",
+      mode: "selection",
+      source: "shortcut",
+      selectionText: ""
+    });
+  } catch (error) {
+    console.error("Failed to run To NIS shortcut", error);
+  }
+});
+
+// The selection may live in an iframe; ask every frame and use the one that has text.
+async function findSelectionFrame(tabId) {
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => Boolean(window.getSelection()?.toString().trim())
+    });
+    return results.find((entry) => entry.result)?.frameId ?? 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function sendToContentScript(tabId, frameId, payload) {
+  try {
+    await chrome.tabs.sendMessage(tabId, payload, { frameId });
     return;
   } catch (error) {
     if (!isMissingReceiverError(error)) {
@@ -59,11 +93,11 @@ async function sendToContentScript(tabId, payload) {
   }
 
   await chrome.scripting.executeScript({
-    target: { tabId },
+    target: { tabId, frameIds: [frameId] },
     files: ["content.js"]
   });
 
-  await chrome.tabs.sendMessage(tabId, payload);
+  await chrome.tabs.sendMessage(tabId, payload, { frameId });
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {

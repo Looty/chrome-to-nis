@@ -1,3 +1,11 @@
+// Whole file runs inside a guard: top-level const/let would throw on a second
+// injection (background fallback), so the guard has to wrap the declarations too.
+(() => {
+if (window.__toNisLoaded) {
+  return;
+}
+window.__toNisLoaded = true;
+
 const CURRENCY_DEFS = [
   { code: "USD", tokens: ["US$", "$", "USD"] },
   { code: "EUR", tokens: ["EUR", "€"] },
@@ -33,18 +41,26 @@ let lastSelectionSnapshot = {
 
 let activeTooltip = null;
 const TOOLTIP_TOKENS = {
-  width: 252,
   baseCountdownMs: 5000,
-  perDetailMs: 1000,
-  radius: 16,
-  railWidth: 6
+  perDetailMs: 1000
 };
+const MAX_DETAILS = 8;
+const SIDES = ["top", "bottom", "left", "right"];
+let bubbleSide = "top";
+try {
+  chrome.storage.local.get("bubbleSide").then((stored) => {
+    if (SIDES.includes(stored.bubbleSide)) {
+      bubbleSide = stored.bubbleSide;
+    }
+  });
+} catch {
+  // Storage is only a convenience; the default side still works.
+}
+const CHIP_LIFETIME_MS = 12000;
+const MAX_SCAN_NODES = 4000;
+const SKIP_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEXTAREA", "INPUT"]);
 
-// Guard against double-injection: the background falls back to
-// scripting.executeScript when the static script doesn't answer.
-if (!window.__toNisLoaded) {
-  window.__toNisLoaded = true;
-
+{
   document.addEventListener(
     "contextmenu",
     (event) => {
@@ -95,9 +111,13 @@ if (!window.__toNisLoaded) {
 }
 
 async function handleRun(message) {
+  let selectionText = message.selectionText || "";
+
   if (message.mode === "selection") {
     const liveSelection = window.getSelection();
     const liveSelectionText = liveSelection?.toString().trim() || "";
+    // The keyboard shortcut carries no text: read the live selection instead.
+    selectionText = selectionText || liveSelectionText;
     const matchingSnapshot = lastSelectionSnapshot.text && message.selectionText
       ? normalizeSelectionText(lastSelectionSnapshot.text) === normalizeSelectionText(message.selectionText)
       : false;
@@ -106,11 +126,24 @@ async function handleRun(message) {
       lastContext.selectionRect = getSelectionAnchorRect(liveSelection, lastContext.x, lastContext.y);
     } else if (matchingSnapshot && lastSelectionSnapshot.rect) {
       lastContext.selectionRect = lastSelectionSnapshot.rect;
+    } else if (message.source === "shortcut") {
+      // No right-click happened, so any stored position is stale.
+      lastContext = { x: 0, y: 0, selectionRect: null, target: null };
+    }
+
+    if (!selectionText) {
+      showTooltip({
+        kind: "error",
+        title: "Nothing selected",
+        subtitle: "Select a price, then press the shortcut again.",
+        timestampText: "Nothing to convert"
+      });
+      return;
     }
   }
 
   const parsedPrices = message.mode === "selection"
-    ? parsePriceText(message.selectionText || "")
+    ? parsePriceText(selectionText)
     : parsePricesFromElement(lastContext.target);
 
   if (!parsedPrices.length) {
@@ -132,7 +165,7 @@ async function handleRun(message) {
     throw new Error(response?.error || "Could not convert prices.");
   }
 
-  showConversionTooltip(response.results);
+  showConversionTooltip(response.results, getScope(message.mode));
 }
 
 function parsePricesFromElement(element) {
@@ -269,266 +302,328 @@ function buildTokenPattern() {
   return tokens.sort((a, b) => b.length - a.length).join("|");
 }
 
-function showConversionTooltip(results) {
+// Footnote presentation: the price on the page gets a dotted underline and the
+// NIS value appears on it (a bubble for one price, inline chips for several).
+// Everything lives in a fixed shadow-DOM layer; the page's own DOM is untouched.
+
+function getScope(mode) {
+  if (mode === "selection") {
+    const selection = window.getSelection();
+    if (selection?.rangeCount && selection.toString().trim()) {
+      const range = selection.getRangeAt(0);
+      return { root: range.commonAncestorContainer, range };
+    }
+    return null;
+  }
+
+  return lastContext.target ? { root: lastContext.target, range: null } : null;
+}
+
+// Finds a DOM Range for each converted price so the footnote can sit on it.
+// Entries are null when a price can't be located (e.g. split across elements).
+function locatePrices(scope, results) {
+  const rootElement = scope.root instanceof Element ? scope.root : scope.root.parentElement;
+  if (!rootElement) {
+    return results.map(() => null);
+  }
+
+  const nodes = [];
+  const walker = document.createTreeWalker(rootElement, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent || SKIP_TAGS.has(parent.tagName)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      if (scope.range && !scope.range.intersectsNode(node)) {
+        return NodeFilter.FILTER_REJECT;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  while (nodes.length < MAX_SCAN_NODES && walker.nextNode()) {
+    nodes.push(walker.currentNode);
+  }
+
+  const used = new Set();
+  return results.map((result) => {
+    const pattern = new RegExp(escapeRegex(result.raw).replace(/\s+/g, "\\s+"), "g");
+
+    for (const node of nodes) {
+      pattern.lastIndex = 0;
+      for (const match of node.data.matchAll(pattern)) {
+        const start = match.index;
+        const end = start + match[0].length;
+        const key = `${nodes.indexOf(node)}:${start}`;
+        const inSelection = !scope.range ||
+          (scope.range.comparePoint(node, start) === 0 && scope.range.comparePoint(node, end) === 0);
+
+        if (used.has(key) || !inSelection) {
+          continue;
+        }
+
+        used.add(key);
+        const range = document.createRange();
+        range.setStart(node, start);
+        range.setEnd(node, end);
+        return range;
+      }
+    }
+
+    return null;
+  });
+}
+
+function showConversionTooltip(results, scope) {
+  const located = scope ? locatePrices(scope, results) : results.map(() => null);
   const hasWarning = results.some((result) => result.rateInfo.cacheStatus === "stale-fallback");
-  const newestFetchedAt = Math.max(...results.map((result) => result.rateInfo.fetchedAt));
-  const stalestAge = Math.max(...results.map((result) => result.rateInfo.staleMs));
+  const kind = hasWarning ? "warning" : "success";
 
   if (results.length === 1) {
     const [result] = results;
-    showTooltip({
-      kind: hasWarning ? "warning" : "success",
-      title: formatNis(result.convertedAmount),
-      subtitle: `1 ${result.currencyCode} = ${formatRate(result.rateInfo.rate)} NIS`,
-      timestampText: buildTimestampText(result.rateInfo)
+    const [range] = located;
+    showOverlay({
+      kind,
+      marks: range ? [{ range, result, chip: false }] : [],
+      anchorFn: range ? () => toPlainRect(range.getBoundingClientRect()) : null,
+      bubble: {
+        title: formatNis(result.convertedAmount),
+        subtitle: `1 ${result.currencyCode} = ${formatRate(result.rateInfo.rate)} NIS`,
+        stamp: buildTimestampText(result.rateInfo),
+        copyText: result.convertedAmount.toFixed(2)
+      }
     });
     return;
   }
 
-  showTooltip({
-    kind: hasWarning ? "warning" : "success",
-    title: `${results.length} prices converted`,
-    subtitle: `Latest rate update ${formatRelativeAge(Date.now() - newestFetchedAt)} ago`,
-    timestampText: `Stalest cached rate: ${formatRelativeAge(stalestAge)} ago`,
-    details: results.map((result) => ({
-      label: result.raw,
-      value: formatNis(result.convertedAmount),
-      meta: `${result.currencyCode} at ${formatRate(result.rateInfo.rate)}`
-    }))
+  if (located.every(Boolean)) {
+    showOverlay({
+      kind,
+      marks: results.map((result, index) => ({ range: located[index], result, chip: true })),
+      anchorFn: null,
+      bubble: null
+    });
+    return;
+  }
+
+  const newestFetchedAt = Math.max(...results.map((result) => result.rateInfo.fetchedAt));
+  const stalestAge = Math.max(...results.map((result) => result.rateInfo.staleMs));
+  const total = results.reduce((sum, result) => sum + result.convertedAmount, 0);
+
+  showOverlay({
+    kind,
+    marks: [],
+    anchorFn: null,
+    bubble: {
+      title: `${results.length} prices converted`,
+      subtitle: `Total ${formatNis(total)} · rates ${formatRelativeAge(Date.now() - newestFetchedAt)} old`,
+      stamp: `Stalest cached rate: ${formatRelativeAge(stalestAge)} ago`,
+      details: results.map((result) => ({
+        label: result.raw,
+        value: formatNis(result.convertedAmount),
+        meta: `${result.currencyCode} at ${formatRate(result.rateInfo.rate)}`
+      }))
+    }
   });
 }
 
 function showTooltip({ kind, title, subtitle, timestampText, details = [] }) {
-  activeTooltip?.destroy();
-  activeTooltip = createTooltip({ kind, title, subtitle, timestampText, details });
-  activeTooltip.show();
+  showOverlay({
+    kind,
+    marks: [],
+    anchorFn: null,
+    bubble: { title, subtitle, stamp: timestampText, details }
+  });
 }
 
-function createTooltip({ kind, title, subtitle, timestampText, details }) {
-  const host = document.createElement("div");
-  host.style.position = "fixed";
-  host.style.left = "0";
-  host.style.top = "0";
-  host.style.zIndex = "2147483647";
+function showOverlay(config) {
+  activeTooltip?.destroy();
+  activeTooltip = createOverlay(config);
+}
 
-  const countdownMs = TOOLTIP_TOKENS.baseCountdownMs + TOOLTIP_TOKENS.perDetailMs * Math.min(details.length, 8);
+function copyToClipboard(text, onDone) {
+  try {
+    Promise.resolve(navigator.clipboard?.writeText(text)).then(onDone, () => {});
+  } catch {
+    // Clipboard can be blocked on some pages; copying is a convenience only.
+  }
+}
+
+function createOverlay({ kind, marks, anchorFn, bubble }) {
+  const host = document.createElement("div");
+  host.style.cssText = "position:fixed;inset:0;z-index:2147483647;pointer-events:none;";
 
   const shadow = host.attachShadow({ mode: "open" });
   const style = document.createElement("style");
   style.textContent = `
-    :host {
-      all: initial;
-    }
-    .card {
-      --text-primary: #0f172a;
-      --text-secondary: #334155;
-      --text-muted: #64748b;
-      --border: rgba(148, 163, 184, 0.28);
-      --surface: rgba(255, 255, 255, 0.96);
-      --surface-strong: rgba(255, 255, 255, 0.99);
-      --detail-bg: rgba(255, 255, 255, 0.56);
-      --detail-border: rgba(148, 163, 184, 0.16);
-      --detail-inset: rgba(255, 255, 255, 0.45);
-      --close-bg: rgba(255, 255, 255, 0.62);
-      --close-bg-hover: rgba(255, 255, 255, 0.96);
-      --shadow: 0 18px 42px rgba(15, 23, 42, 0.18), 0 6px 18px rgba(255, 255, 255, 0.32);
-
-      position: relative;
-      overflow: hidden;
-      width: min(${TOOLTIP_TOKENS.width}px, calc(100vw - 24px));
-      box-sizing: border-box;
-      padding: 12px 12px 12px 16px;
-      border-radius: ${TOOLTIP_TOKENS.radius}px;
-      border: 1px solid var(--border);
-      background: linear-gradient(180deg, var(--surface-strong), var(--surface));
-      color: var(--text-primary);
-      box-shadow: var(--shadow);
+    :host { all: initial; }
+    * { box-sizing: border-box; }
+    .layer {
+      --accent: #14803c;
+      --accent-soft: #dcf3e4;
+      --warn: #b45309;
+      --warn-soft: #fdecc8;
+      position: fixed;
+      inset: 0;
       font-family: "Segoe UI", ui-sans-serif, system-ui, sans-serif;
       font-variant-numeric: tabular-nums;
-      cursor: grab;
-      user-select: none;
     }
     @media (prefers-color-scheme: dark) {
-      .card {
-        --text-primary: #f1f5f9;
-        --text-secondary: #cbd5e1;
-        --text-muted: #94a3b8;
-        --border: rgba(148, 163, 184, 0.3);
-        --surface: rgba(30, 41, 59, 0.97);
-        --surface-strong: rgba(36, 48, 68, 0.99);
-        --detail-bg: rgba(255, 255, 255, 0.06);
-        --detail-border: rgba(148, 163, 184, 0.2);
-        --detail-inset: rgba(255, 255, 255, 0.08);
-        --close-bg: rgba(255, 255, 255, 0.08);
-        --close-bg-hover: rgba(255, 255, 255, 0.18);
-        --shadow: 0 18px 42px rgba(0, 0, 0, 0.45);
+      .layer {
+        --accent: #3ddc8a;
+        --accent-soft: #163a27;
+        --warn: #f2a93b;
+        --warn-soft: #3d2a0b;
       }
     }
-    .card.dragging {
-      cursor: grabbing;
+    .underline {
+      position: fixed;
+      height: 0;
+      border-bottom: 2px dotted var(--accent);
     }
-    .timer {
-      position: absolute;
-      inset: 0 auto 0 0;
-      width: ${TOOLTIP_TOKENS.railWidth}px;
-      border-radius: ${TOOLTIP_TOKENS.radius}px 0 0 ${TOOLTIP_TOKENS.radius}px;
-      transform-origin: top;
-      box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.35);
-      animation: to-nis-countdown ${countdownMs}ms linear forwards;
-    }
-    .card.paused .timer {
-      animation-play-state: paused;
-    }
-    @keyframes to-nis-countdown {
-      from { transform: scaleY(1); }
-      to { transform: scaleY(0); }
-    }
-    .timer.success {
-      background: linear-gradient(180deg, #34d399, #16a34a);
-    }
-    .timer.warning {
-      background: linear-gradient(180deg, #fbbf24, #d97706);
-    }
-    .timer.error {
-      background: linear-gradient(180deg, #fb7185, #dc2626);
-    }
-    .body {
-      position: relative;
-      display: grid;
-      gap: 8px;
-      padding-left: 2px;
-    }
-    .header {
-      display: grid;
-      gap: 4px;
-      padding-right: 24px;
-    }
-    .close {
-      position: absolute;
-      z-index: 1;
-      top: 8px;
-      right: 8px;
-      width: 22px;
-      height: 22px;
-      border: 1px solid var(--detail-border);
+    .layer.warning .underline { border-bottom-color: var(--warn); }
+    .chip {
+      position: fixed;
+      pointer-events: auto;
+      padding: 4px 10px;
+      border: 1px solid var(--accent);
       border-radius: 999px;
-      background: var(--close-bg);
-      color: var(--text-muted);
-      font-size: 14px;
-      line-height: 20px;
-      cursor: pointer;
-      transition: transform 140ms ease, background 140ms ease, color 140ms ease;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font: 700 15px/1.2 ui-monospace, "Cascadia Mono", Consolas, monospace;
+      white-space: nowrap;
+      cursor: copy;
+      box-shadow: 0 3px 10px rgba(0, 0, 0, 0.18);
     }
-    .close:hover {
-      background: var(--close-bg-hover);
-      color: var(--text-primary);
+    .chip.warn { border-color: var(--warn); background: var(--warn-soft); color: var(--warn); }
+    .bubble {
+      position: fixed;
+      pointer-events: auto;
+      width: max-content;
+      min-width: min(220px, calc(100vw - 16px));
+      max-width: min(300px, calc(100vw - 16px));
+      padding: 12px 16px 16px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      background: #0f1a15;
+      color: #e8f2ec;
+      box-shadow: 0 14px 34px rgba(0, 0, 0, 0.35);
+      display: grid;
+      gap: 3px;
+      overflow: visible;
     }
-    .close:active {
-      transform: scale(0.95);
+    .bubble { cursor: grab; user-select: none; touch-action: none; }
+    .bubble.dragging { cursor: grabbing; }
+    .bubble.dragging .arrow { display: none; }
+    .arrow {
+      position: absolute;
+      width: 10px;
+      height: 10px;
+      background: #0f1a15;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      transform: rotate(45deg);
     }
+    .arrow.down { bottom: -6px; border-top: 0; border-left: 0; }
+    .arrow.up { top: -6px; border-bottom: 0; border-right: 0; }
+    .arrow.right { right: -6px; border-bottom: 0; border-left: 0; }
+    .arrow.left { left: -6px; border-top: 0; border-right: 0; }
     .title {
-      margin: 0;
-      font: 700 21px/1.08 "Segoe UI", ui-sans-serif, system-ui, sans-serif;
+      font: 700 26px/1.1 "Segoe UI", ui-sans-serif, system-ui, sans-serif;
       letter-spacing: -0.02em;
     }
-    .subtitle {
-      margin: 0;
-      color: var(--text-secondary);
-      font: 600 12px/1.35 "Segoe UI", ui-sans-serif, system-ui, sans-serif;
-    }
-    .stamp {
-      color: var(--text-muted);
-      font: 500 11px/1.35 "Segoe UI", ui-sans-serif, system-ui, sans-serif;
-    }
-    .details {
-      display: grid;
-      gap: 6px;
-    }
+    .bubble.error .title { font: 700 16px/1.3 "Segoe UI", ui-sans-serif, system-ui, sans-serif; letter-spacing: 0; color: #fda4af; }
+    .subtitle { font: 600 13px/1.35 "Segoe UI", ui-sans-serif, system-ui, sans-serif; color: #c4d4cb; }
+    .stamp { font: 500 12px/1.35 "Segoe UI", ui-sans-serif, system-ui, sans-serif; color: #8ea398; }
+    .bubble.warning .stamp { color: #fbbf24; }
+    .details { display: grid; gap: 5px; margin-top: 6px; }
     .detail {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
-      gap: 6px 8px;
-      align-items: center;
-      padding: 7px 8px;
-      border-radius: 10px;
-      border: 1px solid var(--detail-border);
-      background: var(--detail-bg);
-      box-shadow: inset 0 1px 0 var(--detail-inset);
+      gap: 2px 10px;
+      padding: 6px 8px;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.06);
     }
-    .detail-main {
-      min-width: 0;
-      display: grid;
-      gap: 3px;
+    .detail-label { font: 600 13px/1.3 "Segoe UI", ui-sans-serif, system-ui, sans-serif; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .detail-meta { grid-column: 1; font: 500 12px/1.3 "Segoe UI", ui-sans-serif, system-ui, sans-serif; color: #8ea398; }
+    .detail-value { grid-row: 1 / span 2; grid-column: 2; align-self: center; font: 700 15px/1.2 "Segoe UI", ui-sans-serif, system-ui, sans-serif; }
+    .detail-more { text-align: center; font: 500 12px/1.3 "Segoe UI", ui-sans-serif, system-ui, sans-serif; color: #8ea398; }
+    .progress {
+      position: absolute;
+      left: 12px;
+      right: 12px;
+      bottom: 5px;
+      height: 2px;
+      border-radius: 2px;
+      background: #3ddc8a;
+      transform-origin: left;
+      animation: to-nis-countdown ${countdownFor(bubble)}ms linear forwards;
     }
-    .detail-label {
-      color: var(--text-secondary);
-      font: 600 12px/1.35 "Segoe UI", ui-sans-serif, system-ui, sans-serif;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .detail-meta {
-      color: var(--text-muted);
-      font: 500 11px/1.35 "Segoe UI", ui-sans-serif, system-ui, sans-serif;
-    }
-    .detail-value {
-      color: var(--text-primary);
-      font: 700 14px/1.2 "Segoe UI", ui-sans-serif, system-ui, sans-serif;
-      letter-spacing: -0.02em;
-      text-align: right;
-      white-space: nowrap;
-    }
+    .bubble.warning .progress { background: #fbbf24; }
+    .bubble.error .progress { background: #fb7185; }
+    .bubble.paused .progress { animation-play-state: paused; }
+    @keyframes to-nis-countdown { from { transform: scaleX(1); } to { transform: scaleX(0); } }
+    @media (prefers-reduced-motion: reduce) { .progress { animation: none; display: none; } }
   `;
 
-  const card = document.createElement("div");
-  card.className = "card";
-  card.setAttribute("role", "status");
-  card.setAttribute("aria-live", "polite");
+  const layer = document.createElement("div");
+  layer.className = `layer ${kind}`;
+  const underlineLayer = document.createElement("div");
+  layer.append(underlineLayer);
 
-  const timer = document.createElement("div");
-  timer.className = `timer ${kind === "error" ? "error" : kind === "warning" ? "warning" : "success"}`;
+  const items = marks.map((mark) => {
+    let chipElement = null;
+    if (mark.chip) {
+      chipElement = document.createElement("button");
+      chipElement.type = "button";
+      chipElement.className = `chip${mark.result.rateInfo.cacheStatus === "stale-fallback" ? " warn" : ""}`;
+      chipElement.textContent = formatNis(mark.result.convertedAmount);
+      chipElement.title = `1 ${mark.result.currencyCode} = ${formatRate(mark.result.rateInfo.rate)} NIS · ${buildTimestampText(mark.result.rateInfo)} (click to copy)`;
+      chipElement.addEventListener("click", () => {
+        copyToClipboard(mark.result.convertedAmount.toFixed(2), () => {
+          chipElement.textContent = "Copied";
+          setTimeout(() => { chipElement.textContent = formatNis(mark.result.convertedAmount); }, 1200);
+        });
+      });
+      layer.append(chipElement);
+    }
+    return { range: mark.range, chipElement };
+  });
 
-  const close = document.createElement("button");
-  close.className = "close";
-  close.type = "button";
-  close.textContent = "×";
-  close.setAttribute("aria-label", "Dismiss");
+  let bubbleElement = null;
+  let arrowElement = null;
+  let stampElement = null;
+  const staticAnchor = fallbackAnchor();
 
-  const body = document.createElement("div");
-  body.className = "body";
+  if (bubble) {
+    bubbleElement = document.createElement("div");
+    bubbleElement.className = `bubble ${kind}`;
+    bubbleElement.setAttribute("role", "status");
+    bubbleElement.setAttribute("aria-live", "polite");
 
-  const header = document.createElement("div");
-  header.className = "header";
+    arrowElement = document.createElement("div");
+    arrowElement.className = "arrow down";
 
-  const titleElement = document.createElement("div");
-  titleElement.className = "title";
-  titleElement.textContent = title;
+    const titleElement = document.createElement("div");
+    titleElement.className = "title";
+    titleElement.textContent = bubble.title;
 
-  const subtitleElement = document.createElement("p");
-  subtitleElement.className = "subtitle";
-  subtitleElement.textContent = subtitle;
+    const subtitleElement = document.createElement("div");
+    subtitleElement.className = "subtitle";
+    subtitleElement.textContent = bubble.subtitle;
 
-  const timestampElement = document.createElement("div");
-  timestampElement.className = "stamp";
-  timestampElement.textContent = timestampText;
+    stampElement = document.createElement("div");
+    stampElement.className = "stamp";
+    stampElement.textContent = bubble.stamp;
 
-  header.append(titleElement, subtitleElement, timestampElement);
-  body.append(header);
-  card.append(timer, close, body);
+    bubbleElement.append(arrowElement, titleElement, subtitleElement, stampElement);
 
-  if (details.length) {
-    const detailsWrap = document.createElement("div");
-    detailsWrap.className = "details";
+    if (bubble.details?.length) {
+      const detailsWrap = document.createElement("div");
+      detailsWrap.className = "details";
 
-    for (const item of details.slice(0, 8)) {
-      const detail = document.createElement("div");
-      detail.className = "detail";
-
-      if (typeof item === "string") {
-        detail.textContent = item;
-      } else {
-        const main = document.createElement("div");
-        main.className = "detail-main";
+      for (const item of bubble.details.slice(0, MAX_DETAILS)) {
+        const detail = document.createElement("div");
+        detail.className = "detail";
 
         const label = document.createElement("div");
         label.className = "detail-label";
@@ -542,40 +637,227 @@ function createTooltip({ kind, title, subtitle, timestampText, details }) {
         value.className = "detail-value";
         value.textContent = item.value;
 
-        main.append(label, meta);
-        detail.append(main, value);
+        detail.append(label, meta, value);
+        detailsWrap.append(detail);
       }
 
-      detailsWrap.appendChild(detail);
+      if (bubble.details.length > MAX_DETAILS) {
+        const more = document.createElement("div");
+        more.className = "detail-more";
+        more.textContent = `+${bubble.details.length - MAX_DETAILS} more not shown`;
+        detailsWrap.append(more);
+      }
+
+      bubbleElement.append(detailsWrap);
     }
 
-    body.appendChild(detailsWrap);
+    const progress = document.createElement("div");
+    progress.className = "progress";
+    progress.addEventListener("animationend", destroy);
+    bubbleElement.append(progress);
+
+    if (bubble.copyText) {
+      const originalStamp = bubble.stamp;
+      bubbleElement.title = "Click to copy the amount · drag to move it around the price";
+      bubbleElement.addEventListener("click", () => {
+        if (suppressClick) {
+          return;
+        }
+
+        copyToClipboard(bubble.copyText, () => {
+          stampElement.textContent = `Copied ${bubble.copyText}`;
+          setTimeout(() => { stampElement.textContent = originalStamp; }, 1400);
+        });
+      });
+    }
+
+    bubbleElement.addEventListener("mouseenter", () => bubbleElement.classList.add("paused"));
+    bubbleElement.addEventListener("mouseleave", () => {
+      if (!drag) {
+        bubbleElement.classList.remove("paused");
+      }
+    });
+    bubbleElement.addEventListener("pointerdown", startDrag);
+    bubbleElement.addEventListener("pointermove", moveDrag);
+    bubbleElement.addEventListener("pointerup", endDrag);
+    bubbleElement.addEventListener("pointercancel", endDrag);
+    layer.append(bubbleElement);
   }
 
-  shadow.append(style, card);
+  shadow.append(style, layer);
   document.documentElement.appendChild(host);
 
   let dismissed = false;
-  let dragOffsetX = 0;
-  let dragOffsetY = 0;
-  let hoverPause = false;
-  let dragPause = false;
+  let frame = 0;
+  let drag = null;
+  let suppressClick = false;
+  const chipOnlyTimer = bubble ? null : setTimeout(destroy, CHIP_LIFETIME_MS);
+  // A bubble pinned to fixed coordinates would drift away from the page on
+  // scroll, so it is dismissed instead of repositioned.
+  const dismissOnScroll = Boolean(bubble) && !items.length;
 
-  function syncPaused() {
-    card.classList.toggle("paused", hoverPause || dragPause);
+  function layout() {
+    underlineLayer.textContent = "";
+
+    for (const item of items) {
+      const rects = [...item.range.getClientRects()].filter((rect) => rect.width > 0 && rect.height > 0);
+
+      for (const rect of rects) {
+        const underline = document.createElement("div");
+        underline.className = "underline";
+        underline.style.left = `${rect.left}px`;
+        underline.style.top = `${rect.bottom - 1}px`;
+        underline.style.width = `${rect.width}px`;
+        underlineLayer.append(underline);
+      }
+
+      if (item.chipElement) {
+        const last = rects[rects.length - 1];
+        item.chipElement.hidden = !last;
+        if (last) {
+          const chipWidth = item.chipElement.offsetWidth;
+          const chipHeight = item.chipElement.offsetHeight;
+          const fitsRight = last.right + 4 + chipWidth <= window.innerWidth - 8;
+          item.chipElement.style.left = `${fitsRight ? last.right + 4 : Math.max(8, window.innerWidth - 8 - chipWidth)}px`;
+          item.chipElement.style.top = `${fitsRight ? last.top + (last.height - chipHeight) / 2 : last.bottom + 3}px`;
+        }
+      }
+    }
+
+    if (bubbleElement) {
+      placeBubble();
+    }
   }
 
-  function destroy() {
-    if (dismissed) {
+  function currentAnchor() {
+    return (anchorFn && anchorFn()) || staticAnchor;
+  }
+
+  // Puts the bubble on the chosen side of the price, flipping to the opposite
+  // side when the window has no room.
+  function placeBubble() {
+    if (drag?.moved) {
       return;
     }
 
-    dismissed = true;
-    document.removeEventListener("keydown", onKeyDown, true);
-    host.remove();
-    if (activeTooltip?.destroy === destroy) {
-      activeTooltip = null;
+    const margin = 8;
+    const gap = 12;
+    const anchor = currentAnchor();
+    const width = bubbleElement.offsetWidth;
+    const height = bubbleElement.offsetHeight;
+    const centerX = anchor.left + (anchor.right - anchor.left) / 2;
+    const centerY = anchor.top + (anchor.bottom - anchor.top) / 2;
+    const room = {
+      top: anchor.top - gap - height >= margin,
+      bottom: anchor.bottom + gap + height <= window.innerHeight - margin,
+      left: anchor.left - gap - width >= margin,
+      right: anchor.right + gap + width <= window.innerWidth - margin
+    };
+    const opposite = { top: "bottom", bottom: "top", left: "right", right: "left" };
+    const side = !room[bubbleSide] && room[opposite[bubbleSide]] ? opposite[bubbleSide] : bubbleSide;
+
+    let left;
+    let top;
+    if (side === "top" || side === "bottom") {
+      left = centerX - width / 2;
+      top = side === "top" ? anchor.top - gap - height : anchor.bottom + gap;
+    } else {
+      left = side === "left" ? anchor.left - gap - width : anchor.right + gap;
+      top = centerY - height / 2;
     }
+
+    left = clamp(left, margin, Math.max(margin, window.innerWidth - width - margin));
+    top = clamp(top, margin, Math.max(margin, window.innerHeight - height - margin));
+    bubbleElement.style.left = `${left}px`;
+    bubbleElement.style.top = `${top}px`;
+
+    if (side === "top" || side === "bottom") {
+      arrowElement.className = `arrow ${side === "top" ? "down" : "up"}`;
+      arrowElement.style.top = "";
+      arrowElement.style.left = `${clamp(centerX - left - 5, 12, Math.max(12, width - 22))}px`;
+    } else {
+      arrowElement.className = `arrow ${side === "left" ? "right" : "left"}`;
+      arrowElement.style.left = "";
+      arrowElement.style.top = `${clamp(centerY - top - 5, 12, Math.max(12, height - 22))}px`;
+    }
+  }
+
+  function startDrag(event) {
+    if (event.button !== 0) {
+      return;
+    }
+
+    const rect = bubbleElement.getBoundingClientRect();
+    drag = {
+      startX: event.clientX,
+      startY: event.clientY,
+      offsetX: event.clientX - rect.left,
+      offsetY: event.clientY - rect.top,
+      moved: false
+    };
+    bubbleElement.setPointerCapture(event.pointerId);
+  }
+
+  function moveDrag(event) {
+    if (!drag) {
+      return;
+    }
+
+    if (!drag.moved) {
+      if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 4) {
+        return;
+      }
+
+      drag.moved = true;
+      bubbleElement.classList.add("dragging", "paused");
+    }
+
+    bubbleElement.style.left = `${clamp(event.clientX - drag.offsetX, 8, window.innerWidth - bubbleElement.offsetWidth - 8)}px`;
+    bubbleElement.style.top = `${clamp(event.clientY - drag.offsetY, 8, window.innerHeight - bubbleElement.offsetHeight - 8)}px`;
+  }
+
+  // On release, snap to whichever side of the price the bubble was dropped on
+  // and remember it for next time.
+  function endDrag(event) {
+    if (!drag) {
+      return;
+    }
+
+    const wasMoved = drag.moved;
+    drag = null;
+    bubbleElement.classList.remove("dragging");
+
+    if (!wasMoved) {
+      return;
+    }
+
+    const anchor = currentAnchor();
+    const bubbleRect = bubbleElement.getBoundingClientRect();
+    const dx = bubbleRect.left + bubbleRect.width / 2 - (anchor.left + anchor.right) / 2;
+    const dy = bubbleRect.top + bubbleRect.height / 2 - (anchor.top + anchor.bottom) / 2;
+    const horizontalReach = (bubbleRect.width + (anchor.right - anchor.left)) / 2;
+    const verticalReach = (bubbleRect.height + (anchor.bottom - anchor.top)) / 2;
+
+    bubbleSide = Math.abs(dx) / horizontalReach > Math.abs(dy) / verticalReach
+      ? (dx < 0 ? "left" : "right")
+      : (dy < 0 ? "top" : "bottom");
+    saveBubbleSide();
+
+    suppressClick = true;
+    setTimeout(() => { suppressClick = false; }, 0);
+    if (!bubbleElement.matches(":hover")) {
+      bubbleElement.classList.remove("paused");
+    }
+    placeBubble();
+  }
+
+  function scheduleLayout() {
+    if (dismissOnScroll) {
+      destroy();
+      return;
+    }
+    cancelAnimationFrame(frame);
+    frame = requestAnimationFrame(layout);
   }
 
   function onKeyDown(event) {
@@ -584,111 +866,64 @@ function createTooltip({ kind, title, subtitle, timestampText, details }) {
     }
   }
 
-  function startDrag(event) {
-    if (!(event instanceof PointerEvent) || event.target === close) {
+  function onPointerDown(event) {
+    if (!event.composedPath().includes(host)) {
+      destroy();
+    }
+  }
+
+  function destroy() {
+    if (dismissed) {
       return;
     }
 
-    dragPause = true;
-    syncPaused();
-    card.classList.add("dragging");
-    const rect = host.getBoundingClientRect();
-    dragOffsetX = event.clientX - rect.left;
-    dragOffsetY = event.clientY - rect.top;
-    card.setPointerCapture(event.pointerId);
-  }
-
-  function moveDrag(event) {
-    if (!card.classList.contains("dragging")) {
-      return;
+    dismissed = true;
+    clearTimeout(chipOnlyTimer);
+    cancelAnimationFrame(frame);
+    document.removeEventListener("keydown", onKeyDown, true);
+    document.removeEventListener("pointerdown", onPointerDown, true);
+    window.removeEventListener("scroll", scheduleLayout, true);
+    window.removeEventListener("resize", scheduleLayout);
+    host.remove();
+    if (activeTooltip?.destroy === destroy) {
+      activeTooltip = null;
     }
-
-    const nextLeft = clamp(event.clientX - dragOffsetX, 8, window.innerWidth - host.offsetWidth - 8);
-    const nextTop = clamp(event.clientY - dragOffsetY, 8, window.innerHeight - host.offsetHeight - 8);
-    host.style.left = `${nextLeft}px`;
-    host.style.top = `${nextTop}px`;
   }
 
-  function endDrag(event) {
-    if (!(event instanceof PointerEvent) || !card.classList.contains("dragging")) {
-      return;
-    }
-
-    card.classList.remove("dragging");
-    card.releasePointerCapture(event.pointerId);
-    dragPause = false;
-    syncPaused();
-  }
-
-  function onMouseEnter() {
-    hoverPause = true;
-    syncPaused();
-  }
-
-  function onMouseLeave() {
-    hoverPause = false;
-    syncPaused();
-  }
-
-  timer.addEventListener("animationend", destroy);
-  close.addEventListener("click", destroy);
-  card.addEventListener("pointerdown", startDrag);
-  card.addEventListener("pointermove", moveDrag);
-  card.addEventListener("pointerup", endDrag);
-  card.addEventListener("pointercancel", endDrag);
-  card.addEventListener("mouseenter", onMouseEnter);
-  card.addEventListener("mouseleave", onMouseLeave);
   document.addEventListener("keydown", onKeyDown, true);
+  document.addEventListener("pointerdown", onPointerDown, true);
+  window.addEventListener("scroll", scheduleLayout, true);
+  window.addEventListener("resize", scheduleLayout);
+  layout();
 
-  function show() {
-    positionTooltip(host);
-  }
-
-  return { show, destroy };
+  return { destroy };
 }
 
-function positionTooltip(host) {
-  const margin = 8;
-  const rect = host.getBoundingClientRect();
-  const anchorRect = lastContext.selectionRect || getTargetRect(lastContext.target);
-  const isSelectionAnchor = Boolean(lastContext.selectionRect);
+function saveBubbleSide() {
+  try {
+    chrome.storage.local.set({ bubbleSide }).catch(() => {});
+  } catch {
+    // Extension context can be invalidated after a reload; ignore.
+  }
+}
 
-  if (anchorRect && isSelectionAnchor) {
-    const anchorHeight = anchorRect.bottom - anchorRect.top;
-    const rightSideLeft = anchorRect.right + margin;
-    const leftSideLeft = anchorRect.left - rect.width - margin;
-    const canFitRight = rightSideLeft + rect.width <= window.innerWidth - margin;
-    const canFitLeft = leftSideLeft >= margin;
-    const left = canFitRight
-      ? rightSideLeft
-      : canFitLeft
-        ? leftSideLeft
-        : clamp(anchorRect.left + ((anchorRect.right - anchorRect.left) / 2) - (rect.width / 2), margin, window.innerWidth - rect.width - margin);
-    const top = clamp(
-      anchorRect.top + (anchorHeight / 2) - (rect.height / 2),
-      margin,
-      window.innerHeight - rect.height - margin
-    );
+function countdownFor(bubble) {
+  const rows = bubble?.details?.length || 0;
+  return TOOLTIP_TOKENS.baseCountdownMs + TOOLTIP_TOKENS.perDetailMs * Math.min(rows, MAX_DETAILS);
+}
 
-    host.style.left = `${left}px`;
-    host.style.top = `${top}px`;
-    return;
+// Where a bubble goes when the price itself couldn't be located on the page.
+function fallbackAnchor() {
+  if (lastContext.selectionRect) {
+    return lastContext.selectionRect;
   }
 
-  const preferredTop = anchorRect ? anchorRect.top - rect.height - margin : lastContext.y - rect.height - margin;
-  const hasRoomAbove = preferredTop >= margin;
-  const top = hasRoomAbove
-    ? preferredTop
-    : anchorRect
-      ? anchorRect.bottom + margin
-      : lastContext.y + margin;
-  const preferredLeft = anchorRect
-    ? anchorRect.left + ((anchorRect.right - anchorRect.left) / 2) - (rect.width / 2)
-    : lastContext.x - (rect.width / 2);
-  const left = clamp(preferredLeft, margin, window.innerWidth - rect.width - margin);
+  if (lastContext.x || lastContext.y) {
+    return { left: lastContext.x, right: lastContext.x, top: lastContext.y, bottom: lastContext.y };
+  }
 
-  host.style.left = `${left}px`;
-  host.style.top = `${clamp(top, margin, window.innerHeight - rect.height - margin)}px`;
+  const centerX = window.innerWidth / 2;
+  return { left: centerX, right: centerX, top: 96, bottom: 96 };
 }
 
 function getSelectionAnchorRect(selection, clickX, clickY) {
@@ -717,14 +952,6 @@ function getSelectionAnchorRect(selection, clickX, clickY) {
     const currentDistance = distanceToRectCenter(clickX, clickY, rect);
     return currentDistance < closestDistance ? rect : closest;
   });
-}
-
-function getTargetRect(target) {
-  if (!(target instanceof Element)) {
-    return null;
-  }
-
-  return toPlainRect(target.getBoundingClientRect());
 }
 
 function toPlainRect(rect) {
@@ -791,3 +1018,4 @@ function escapeRegex(value) {
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
+})();
