@@ -17,7 +17,9 @@ const CURRENCY_DEFS = [
   { code: "HKD", tokens: ["HK$", "HKD"] },
   { code: "SGD", tokens: ["S$", "SGD"] },
   { code: "CHF", tokens: ["CHF"] },
-  { code: "CNY", tokens: ["CNY", "RMB", "CN¥"] }
+  { code: "CNY", tokens: ["CNY", "RMB", "CN¥"] },
+  // Shekel prices are converted the other way round, to USD.
+  { code: "ILS", tokens: ["₪", "NIS", "ILS", "ש\"ח", "ש״ח"] }
 ];
 
 const TOKEN_TO_CODE = new Map();
@@ -386,8 +388,8 @@ function showConversionTooltip(results, scope) {
       marks: range ? [{ range, result, chip: false }] : [],
       anchorFn: range ? () => toPlainRect(range.getBoundingClientRect()) : null,
       bubble: {
-        title: formatNis(result.convertedAmount),
-        subtitle: `1 ${result.currencyCode} = ${formatRate(result.rateInfo.rate)} NIS`,
+        title: formatResult(result),
+        subtitle: rateLine(result),
         stamp: buildTimestampText(result.rateInfo),
         copyText: result.convertedAmount.toFixed(2)
       }
@@ -407,7 +409,10 @@ function showConversionTooltip(results, scope) {
 
   const newestFetchedAt = Math.max(...results.map((result) => result.rateInfo.fetchedAt));
   const stalestAge = Math.max(...results.map((result) => result.rateInfo.staleMs));
+  // A total only makes sense when every price converts to the same currency.
+  const targets = new Set(results.map((result) => result.targetCurrency));
   const total = results.reduce((sum, result) => sum + result.convertedAmount, 0);
+  const ageText = `rates ${formatRelativeAge(Date.now() - newestFetchedAt)} old`;
 
   showOverlay({
     kind,
@@ -415,11 +420,13 @@ function showConversionTooltip(results, scope) {
     anchorFn: null,
     bubble: {
       title: `${results.length} prices converted`,
-      subtitle: `Total ${formatNis(total)} · rates ${formatRelativeAge(Date.now() - newestFetchedAt)} old`,
+      subtitle: targets.size === 1
+        ? `Total ${formatMoney(total, [...targets][0])} · ${ageText}`
+        : `Mixed currencies · ${ageText}`,
       stamp: `Stalest cached rate: ${formatRelativeAge(stalestAge)} ago`,
       details: results.map((result) => ({
         label: result.raw,
-        value: formatNis(result.convertedAmount),
+        value: formatResult(result),
         meta: `${result.currencyCode} at ${formatRate(result.rateInfo.rate)}`
       }))
     }
@@ -576,12 +583,12 @@ function createOverlay({ kind, marks, anchorFn, bubble }) {
       chipElement = document.createElement("button");
       chipElement.type = "button";
       chipElement.className = `chip${mark.result.rateInfo.cacheStatus === "stale-fallback" ? " warn" : ""}`;
-      chipElement.textContent = formatNis(mark.result.convertedAmount);
-      chipElement.title = `1 ${mark.result.currencyCode} = ${formatRate(mark.result.rateInfo.rate)} NIS · ${buildTimestampText(mark.result.rateInfo)} (click to copy)`;
+      chipElement.textContent = formatResult(mark.result);
+      chipElement.title = `${rateLine(mark.result)} · ${buildTimestampText(mark.result.rateInfo)} (click to copy)`;
       chipElement.addEventListener("click", () => {
         copyToClipboard(mark.result.convertedAmount.toFixed(2), () => {
           chipElement.textContent = "Copied";
-          setTimeout(() => { chipElement.textContent = formatNis(mark.result.convertedAmount); }, 1200);
+          setTimeout(() => { chipElement.textContent = formatResult(mark.result); }, 1200);
         });
       });
       layer.append(chipElement);
@@ -973,12 +980,21 @@ function normalizeSelectionText(text) {
   return text.replace(/\s+/g, " ").trim();
 }
 
-function formatNis(amount) {
-  return new Intl.NumberFormat("en-IL", {
+function formatMoney(amount, currency) {
+  return new Intl.NumberFormat("en-US", {
     style: "currency",
-    currency: "ILS",
+    currency,
     maximumFractionDigits: 2
   }).format(amount);
+}
+
+function formatResult(result) {
+  return formatMoney(result.convertedAmount, result.targetCurrency);
+}
+
+function rateLine(result) {
+  const target = result.targetCurrency === "ILS" ? "NIS" : result.targetCurrency;
+  return `1 ${result.currencyCode} = ${formatRate(result.rateInfo.rate)} ${target}`;
 }
 
 function formatRate(rate) {
