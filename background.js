@@ -3,6 +3,7 @@ const COMMAND_ID = "convert-selection";
 const CACHE_TTL_MS = 60 * 60 * 1000;
 const API_URL = "https://open.er-api.com/v6/latest/ILS";
 const STORAGE_KEY = "rateCacheV2";
+const REVERSE_TARGET = "USD";
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.removeAll(() => {
@@ -122,17 +123,39 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 });
 
 async function convertPrices(prices) {
-  const uniqueCurrencies = [...new Set(prices.map((price) => price.currencyCode))];
+  // ILS prices are converted the other way round, to USD.
+  const uniqueCurrencies = [...new Set(prices.map((price) => (price.currencyCode === "ILS" ? REVERSE_TARGET : price.currencyCode)))];
   const table = await getRateTable(uniqueCurrencies);
 
   return prices.map((price) => {
-    const rateInfo = buildRateInfo(price.currencyCode, table);
+    const reverse = price.currencyCode === "ILS";
+    const targetCurrency = reverse ? REVERSE_TARGET : "ILS";
+    const rateInfo = reverse
+      ? buildReverseRateInfo(table)
+      : buildRateInfo(price.currencyCode, table);
     return {
       ...price,
+      targetCurrency,
       convertedAmount: roundMoney(price.amount * rateInfo.rate),
       rateInfo
     };
   });
+}
+
+// Units of the target currency per 1 ILS, straight from the table.
+function buildReverseRateInfo(table) {
+  const usdPerIls = table.rates[REVERSE_TARGET];
+  if (typeof usdPerIls !== "number" || usdPerIls <= 0) {
+    throw new Error(`${REVERSE_TARGET} rate missing`);
+  }
+
+  return {
+    currencyCode: "ILS",
+    rate: usdPerIls,
+    fetchedAt: table.fetchedAt,
+    staleMs: Date.now() - table.fetchedAt,
+    cacheStatus: table.cacheStatus
+  };
 }
 
 // One request to /latest/ILS returns units-per-ILS for every currency
@@ -141,7 +164,7 @@ async function getRateTable(neededCurrencies) {
   const now = Date.now();
   const cached = await loadCache();
   const cacheCovers = cached &&
-    neededCurrencies.every((code) => code === "ILS" || typeof cached.rates[code] === "number");
+    neededCurrencies.every((code) => typeof cached.rates[code] === "number");
 
   if (cacheCovers && now - cached.fetchedAt < CACHE_TTL_MS) {
     return { ...cached, cacheStatus: "cached" };
